@@ -1,0 +1,944 @@
+---
+title: "OSM_microbiome_workflow_smoking_status"
+output: html_document
+date: "2026-01-03"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Analysis Overview
+
+This analysis implements an OSM microbiome workflow to characterize and compare microbial community composition between smokers and non-smokers. The objective of this workflow is to assess whether smoking status is associated with differences in microbiome diversity, structure, and taxonomic abundance.
+
+The workflow begins with the import and preprocessing of microbiome data, including quality control, filtering, and normalization steps to ensure comparability across samples. Metadata describing participant characteristics, including smoking status, is integrated to enable group-based comparisons.
+
+Subsequent analyses focus on:
+
+Alpha diversity to evaluate within-sample microbial richness and evenness.
+
+Beta diversity to examine differences in overall microbial community composition between smokers and non-smokers.
+
+Ordination and visualization techniques to explore clustering patterns related to smoking status.
+
+Differential abundance analyses to identify specific taxa associated with smoking behavior.
+
+All analyses are conducted within a reproducible R Markdown framework, allowing for transparent documentation of methods, results, and interpretations. This workflow is designed to provide a comprehensive overview of how smoking may influence the oral/OSM microbiome.
+
+
+## Libraries
+
+This section clears the R environment and loads the packages required for data manipulation, visualization, ecological analysis, and microbiome-specific statistical modeling. These libraries support diversity analyses, multivariate methods, contamination correction, and differential abundance testing used throughout the OSM microbiome workflow.
+
+```{r Library}
+
+rm(list = ls())
+
+# library for plotting
+library(ggplot2)
+# library for most analysis functions such as PCA etc
+library(vegan)
+# library for maaslin
+#BiocManager::install("Maaslin2")
+library(Maaslin2)
+
+library(tidyr)
+library(dplyr)
+library(microDecon)
+library(readr)
+
+```
+
+
+## Data Preparation
+
+Metadata and taxonomic abundance data are imported and harmonized for downstream microbiome analyses. Samples are filtered to define three analysis datasets: (i) all biological samples excluding contact lens samples, (ii) samples including negative controls, and (iii) samples excluding both positive and negative controls. Taxonomic profiles are restricted to the species level, non-bacterial taxa are removed, and sample identifiers are standardized between metadata and abundance tables. Species and samples with zero abundance across all observations are excluded, and metadata are refiltered to match the final abundance matrices.
+
+
+```{r Data Preparation}
+
+# Load of data
+
+#Read metadata
+metadata <- read.csv("../INPUT/OSM_metadata_smokers_contact_complete.csv", sep = ",", header = TRUE)
+metadata$treatment <- ifelse(metadata$treatment == "control", "non-smoker", metadata$treatment)
+
+# Load the RDS file
+data_bacteria <- readRDS("../INPUT/metaphlan/merged_output.rds")
+data_fungi <- read_tsv("../INPUT/micop/merged_taxonomy_fungi.tsv")
+data_virus <- read_tsv("../INPUT/micop/merged_taxonomy_viral.tsv")
+
+
+#-------
+  
+#Data Preparation--------------------------------
+#We prepare 4 metadata
+
+#Metadata general 
+metadata_smokers_general <- metadata[metadata$treatment!="contact lense", ]
+metadata_smokers_general$sample <- gsub("_$","", metadata_smokers_general$sample )
+metadata_smokers_general <-metadata_smokers_general[metadata_smokers_general$sample_name!="18_CR", ]
+
+#Metadata smokers with negative control
+metadata_smokers_with_Neg <- metadata_smokers_general[metadata_smokers_general$treatment!="positive control", ]
+
+#Metadata without Postive and negative control without decontamination
+metadata_smokers <- metadata_smokers_with_Neg[metadata_smokers_with_Neg$treatment!="negative control", ]
+
+#Preparation of Data RDS
+#Selecting only the species level
+#Bacteria
+data_species_bacteria <- data_bacteria$species
+colnames(data_species_bacteria) <- gsub("*X","", colnames(data_species_bacteria) )
+colnames(data_species_bacteria) <- gsub("_metaphlan","", colnames(data_species_bacteria) )
+data_species_bacteria <- data_species_bacteria[!grepl("k__Eukaryota", data_species_bacteria$clade_name), ]
+
+#Fungi
+data_species_fungi <- data_fungi[data_fungi$RANK=="species", ]
+data_species_fungi <- data_species_fungi[,-c(1:3)]
+colnames(data_species_fungi) <- gsub("_micop_fungi_abundance.txt","", colnames(data_species_fungi) )
+names(data_species_fungi)[names(data_species_fungi) == "TAXPATHSN"] <- "clade_name"
+
+#Virus
+data_species_virus <- data_virus[data_virus$RANK=="species", ]
+data_species_virus <- data_species_virus[,-c(1:3)]
+colnames(data_species_virus) <- gsub("_micop_viral_abundance.txt","", colnames(data_species_virus) )
+names(data_species_virus)[names(data_species_virus) == "TAXPATHSN"] <- "clade_name"
+
+data_species_virus <- as.data.frame(data_species_virus)
+# Remove rows where clade_name contains 'Human endogenous retrovirus' or 'HERV'
+data_species_virus <- data_species_virus[!grepl("Human endogenous retrovirus|HERV", data_species_virus$clade_name, ignore.case = TRUE), ]
+
+```
+
+
+```{r filtering_of_microorganisms }
+
+source("Functions_presentation/Filtering_preNorm.R") 
+
+filtered_bacteria <- filter_species_data(
+  data_species_bacteria,
+  metadata_smokers_general,
+  metadata_smokers_with_Neg,
+  metadata_smokers
+)
+
+filtered_fungi <- filter_species_data(
+  data_species_fungi,
+  metadata_smokers_general,
+  metadata_smokers_with_Neg,
+  metadata_smokers
+)
+
+
+filtered_virus <- filter_species_data(
+  data_species_virus,
+  metadata_smokers_general,
+  metadata_smokers_with_Neg,
+  metadata_smokers
+)
+
+metadata_smokers_virus <- filtered_virus$metadata_smokers
+
+```
+
+
+
+## Decontamination with microDecon
+
+This step applies microDecon to remove potential contaminant taxa using negative control samples. Species identified as contaminants are filtered from the abundance table when sufficient taxa are present, after which negative control samples, zero-abundance species, and empty samples are removed. Metadata are refiltered to match the decontaminated dataset, producing a cleaned species table and corresponding metadata for downstream analyses.
+
+```{r MicroDecon_step }
+
+#Bacteria
+
+source("Functions_presentation/Microdecon_method.R") 
+
+result_bacteria <- run_microdecon(filtered_bacteria$data_with_Neg, filtered_bacteria$metadata_smokers)
+
+data_species_filtered_decontam_bacteria <- result_bacteria$data
+metadata_smokers_decontam_bacteria <- result_bacteria$metadata
+removed_clades_bacteria <- result_bacteria$removed_otus
+
+#Fungi
+
+result_fungi <- run_microdecon(filtered_fungi$data_with_Neg, filtered_fungi$metadata_smokers)
+
+data_species_filtered_decontam_fungi <- result_fungi$data
+metadata_smokers_decontam_fungi <- result_fungi$metadata
+removed_clades_fungi <- result_fungi$removed_otus
+
+
+#Virus
+
+result_virus <- run_microdecon(filtered_virus$data_with_Neg, filtered_virus$metadata_smokers)
+
+data_species_filtered_decontam_virus <- result_virus$data
+metadata_smokers_decontam_virus <- result_virus$metadata
+removed_clades_virus <- result_virus$removed_otus
+
+
+```
+
+## Re-normalization
+
+Sequencing statistics are integrated with the decontaminated species abundance table to adjust for library size differences across samples. When sufficient taxa are present, read counts are recalibrated and abundances are renormalized; otherwise, the original abundances are retained. Pseudo-count–based absolute abundance estimates are then computed for downstream statistical analyses.
+
+
+
+```{r Re-normalization}
+# Normalization functions and stats table (loaded once)
+source("Functions_presentation/Normalization_and_Stats_reads.R") 
+stats_table <- read.csv("../../INPUT/stats_table.csv", header = TRUE)
+source("Functions_presentation/ReNormalization.R") 
+
+
+##BACTERIA
+# Prepare stats
+stats_subset_table_bacteria <- prepare_stats_table(
+  stats_table = stats_table,
+  metadata_general = metadata_smokers_general,
+  metadata_target = metadata_smokers_decontam_bacteria
+)
+
+stats_subset_bacteria <- stats_subset_table_bacteria$stats_subset
+stats_subset_general_bacteria <- stats_subset_table_bacteria$stats_subset_general
+
+# Renormalization
+renorm_bacteria <- renormalize_if_needed(
+  data = data_species_filtered_decontam_bacteria,
+  stats_subset = stats_subset_bacteria,
+  read_column_suffix = "metaphlan"
+)
+
+data_renormalized_bacteria <- renorm_bacteria$data_renormalized
+stats_subset_bacteria <- renorm_bacteria$stats_subset
+
+# Pseudo-counts
+absolute_counts_bacteria <-
+  calculate_pseudo_counts(data_renormalized_bacteria, stats_subset_bacteria)
+
+##FUNGI
+
+# Prepare stats
+stats_subset_table_fungi <- prepare_stats_table(
+  stats_table = stats_table,
+  metadata_general = metadata_smokers_general,
+  metadata_target = metadata_smokers_decontam_fungi
+)
+
+stats_subset_fungi <- stats_subset_table_fungi$stats_subset
+stats_subset_general_fungi <- stats_subset_table_fungi$stats_subset_general
+
+# Renormalization
+renorm_fungi <- renormalize_if_needed(
+  data = data_species_filtered_decontam_fungi,
+  stats_subset = stats_subset_fungi,
+  read_column_suffix = "micop_fungi"
+)
+
+data_renormalized_fungi <- renorm_fungi$data_renormalized
+stats_subset_fungi <- renorm_fungi$stats_subset
+
+# Pseudo-counts
+absolute_counts_fungi <-
+  calculate_pseudo_counts(data_renormalized_fungi, stats_subset_fungi)
+
+
+##VIRUS
+data_species_filtered_virus <- filtered_virus$data_smokers
+
+data_species_filtered_virus <- data_species_filtered_virus[rowSums(data_species_filtered_virus[,-1] != 0) > 1, ]
+
+
+# Prepare stats
+stats_subset_table_virus <- prepare_stats_table(
+  stats_table = stats_table,
+  metadata_general = metadata_smokers_general,
+  metadata_target = metadata_smokers_virus
+)
+
+stats_subset_virus <- stats_subset_table_virus$stats_subset
+stats_subset_general_virus <- stats_subset_table_virus$stats_subset_general
+
+# Define read column suffix
+read_column_suffix <- "micop_virus"
+
+# -------------------------------
+# 1. Target (decontam) virus renormalization
+# -------------------------------
+if (nrow(data_species_filtered_virus) > 20) {
+  renorm_virus <- adjust_reads_and_normalize(
+    data_species_filtered_virus,
+    stats_subset_virus,
+    read_column_suffix = read_column_suffix
+  )
+  
+  data_renormalized_virus <- renorm_virus$renormalized_data
+  stats_subset_virus <- renorm_virus$updated_stats
+} else {
+  data_renormalized_virus <- filtered_virus$data_smokers
+  
+  read_col <- paste0("Reads_after_dedup_", read_column_suffix)
+  if (!(read_col %in% colnames(stats_subset_virus))) {
+    stop(paste("Column", read_col, "not found in stats_subset_virus."))
+  }
+  
+  stats_subset_virus$Reads_after_dedup_selected <- stats_subset_virus[[read_col]]
+}
+
+# Compute pseudo-counts
+absolute_counts_virus <- calculate_pseudo_counts(data_renormalized_virus, stats_subset_virus)
+
+
+```
+
+
+
+## Post-decontamination Summary Statistics
+
+Basic descriptive statistics are calculated for each species in the decontaminated dataset, including mean and median abundance, prevalence across samples, and absolute presence. These metrics provide an overview of species distribution and consistency across samples after decontamination and normalization.
+
+
+```{r Stats }
+
+compute_taxon_stats <- function(tax_data) {
+
+  nsamples <- ncol(tax_data)
+
+  tax_data$Mean <- apply(tax_data[, 2:nsamples], 1, mean)
+
+  tax_data$Median <- apply(tax_data[, 2:nsamples], 1, median)
+
+  tax_data$presence_proportion <- rowSums(tax_data[, 2:nsamples] > 0) / (nsamples - 1)
+
+  tax_data$Abs_presence <- rowSums(tax_data[, 2:nsamples] > 0)
+
+  return(tax_data)
+}
+
+```
+
+```{r Stats }
+
+##BACTERIA
+taxData_decon_norm_stats_bacteria <-compute_taxon_stats(data_renormalized_bacteria)
+
+# Optional: write metadata
+#write.csv(metadata_smokers_decontam_bacteria,file = "../INPUT/metadata_bacteria_smokers_decontam.csv",row.names = FALSE)
+
+##FUNGI
+taxData_decon_norm_stats_fungi <- compute_taxon_stats(data_renormalized_fungi)
+
+#write.csv(metadata_smokers_decontam_fungi,file = "../INPUT/metadata_fungi_smokers_decontam.csv",row.names = FALSE)
+
+
+##VIRUS
+
+taxData_decon_norm_stats_virus <- compute_taxon_stats(data_renormalized_virus)
+
+#write.csv(metadata_smokers_decontam_virus,file = "../INPUT/metadata_virus_smokers_decontam.csv",row.names = FALSE)
+
+
+```
+
+
+## Descriptive Statistics of the Study Population
+
+This section summarizes key demographic characteristics of the study population by smoking status, including sample size, sex distribution, and age statistics. A chi-squared test is performed to assess differences in sex distribution between groups, providing an overview of cohort comparability.
+
+```{r Descriptive experimental setup}
+
+library(gridExtra)
+library(grid)
+
+# Assuming metadata_smokers_labels is your dataframe
+summary_table <- metadata_smokers %>%
+  group_by(treatment) %>%  # Assuming 'treatment' indicates smoking status
+  summarise(
+    Total = n(),
+    Female = sum(sex == "f", na.rm = TRUE),
+    Male = sum(sex == "m", na.rm = TRUE),
+    Age_Mean = mean(age, na.rm = TRUE),
+    SD_Age = sd(age, na.rm = TRUE),
+    Variance_Age = var(age, na.rm = TRUE)
+  )
+
+# Perform Chi-Squared Test on Sex Distribution
+
+sex_table <- table(metadata_smokers$treatment, metadata_smokers$sex)
+chi_test <- chisq.test(sex_table)
+
+# Add Chi-Squared Test results
+summary_table$Age_Mean <- round(summary_table$Age_Mean, 2)
+summary_table$SD_Age <- round(summary_table$SD_Age, 2)
+summary_table$Variance_Age <- round(summary_table$Variance_Age, 2)
+summary_table$Chi_Squared_Test <- round(chi_test$statistic, 2)
+
+colnames(summary_table) <-c("Treatment", "Total", "Female", "Male", "Mean (Age)", "SD (Age)", "Variance (Age)", "Chi-Squared Test (Sex)")
+
+# Create the table without row names
+table_grob <- tableGrob(summary_table, theme = ttheme_minimal(), rows = NULL)
+
+# Add horizontal lines
+lines <- gList(
+  segmentsGrob(x0 = 0, x1 = 1, y0 = 0.98, y1 = 0.98, gp = gpar(lwd = 2)),  # Line below headers
+  segmentsGrob(x0 = 0, x1 = 1, y0 = 0.02, y1 = 0.02, gp = gpar(lwd = 3))   # Bold line at bottom
+)
+
+# Save to PDF
+#png("../../OUTPUT/Table_1.png",width = 8.5,height = 1.5,units = "in",res = 300)
+
+#grid.draw(grobTree(table_grob, lines))
+
+#dev.off()
+
+
+```
+
+
+## Prevalence Analysis
+
+This section evaluates species prevalence across samples by summarizing the proportion of samples in which each species is detected. Prevalence distributions are visualized to characterize common and rare taxa in the decontaminated dataset prior to downstream comparative analyses.
+
+```{r Analysis_1 Prevalesence}
+source("Functions_presentation/Prevalence.R") 
+
+### pre-analysis  ###
+
+# Data_species only smokers cumulative plot
+
+prevalence_bacteria <- count_prevalence_steps(taxData_decon_norm_stats_bacteria$presence_proportion)
+
+# plot_prevalence_counts(prevalence_bacteria)
+
+prevalence_fungi <- count_prevalence_steps(taxData_decon_norm_stats_fungi$presence_proportion)
+
+# plot_prevalence_counts(prevalence_fungi)
+
+prevalence_virus <- count_prevalence_steps(taxData_decon_norm_stats_virus$presence_proportion)
+
+# plot_prevalence_counts(prevalence_virus)
+
+
+```
+
+
+## Taxonomic Composition and Relative Abundance
+
+Species- and phylum-level relative abundances are calculated and visualized for the decontaminated, renormalized dataset. Low-abundance taxa are grouped to simplify interpretation, and mean relative abundances are computed per treatment group. Top taxa per smoking status are identified to highlight the most prevalent and abundant microbes in the cohort, providing a foundation for downstream comparative analyses.
+
+```{r Analysis_2 Taxonomy Plot}
+source("Functions_presentation/Taxonomy_relative_abundance.R") 
+source("Functions_presentation/Taxonomy_RA_Mean.R") 
+source("Functions_presentation/color_palettes.R") 
+
+phyla_relative_abundance_mean_bacteria <- plot_relative_abundance_with_means(
+  data_species = data_renormalized_bacteria,
+  metadata = metadata_smokers_decontam_bacteria,
+  level = "Phyla",
+  low_abundance_threshold = 10,  # <-- here!
+  colors_list = bacterial_phyla_colors,
+  genus_colors = bacterial_phyla_colors, 
+  group_var = "treatment",
+  tag_label = "(A)"
+)
+
+
+names(bacterial_species_colors) <-gsub("_", " ", names(bacterial_species_colors))
+
+# Example: Genus plot with 10% threshold for grouping low abundance taxa
+species_relative_abundance_mean_bacteria <- plot_relative_abundance_with_means(
+  data_species = data_renormalized_bacteria,
+  metadata = metadata_smokers_decontam_bacteria,
+  level = "Species",
+  low_abundance_threshold = 10,  # <-- here!
+  colors_list = bacterial_species_colors,
+  genus_colors = bacterial_species_colors, 
+  group_var = "treatment",
+  tag_label = "(B)"
+)
+
+
+phylum_abundance_data_bacteria <- phyla_relative_abundance_mean_bacteria$abundance_data
+species_abundance_data_bacteria <- species_relative_abundance_mean_bacteria$abundance_data
+
+
+#Table with the most abundant bacterial microbes in the dataset--------------------------
+
+
+# 3. Group and summarize: top N species per treatment
+top_n <- 5  # change to how many top species you want per group
+
+top_species_per_group_bacteria <- species_abundance_data_bacteria %>%
+  group_by(treatment, Species) %>%
+  summarise(mean_RA = mean(RA, na.rm = TRUE), .groups = "drop") %>%
+  group_by(treatment) %>%
+  slice_max(mean_RA, n = top_n, with_ties = FALSE) %>%
+  arrange(treatment, desc(mean_RA))
+
+#------------------------------------
+
+# 2. Aggregate to phylum level per sample
+library(dplyr)
+
+phylum_abundance_cleaned_bacteria <- phylum_abundance_data_bacteria %>%
+  select(-n, -label, -Color_Phyla, -Legend_Taxon) %>%
+  group_by(samples, treatment, Phyla) %>%
+  summarise(RA = round(sum(RA, na.rm = TRUE), 1), .groups = "drop")
+
+# 5. Get top phyla per treatment
+top_n <- 5
+top_phyla_per_group_bacteria <- phylum_abundance_cleaned_bacteria %>%
+  group_by(treatment, Phyla) %>%
+  summarise(mean_RA = mean(RA, na.rm = TRUE), .groups = "drop") %>%
+  group_by(treatment) %>%
+  slice_max(mean_RA, n = top_n, with_ties = FALSE) %>%
+  arrange(treatment, desc(mean_RA))
+
+
+```
+
+```{r Analysis_2 Taxonomy Plot}
+# Load the function from the external R file
+source("Functions_presentation/Taxonomy_relative_abundance.R") 
+source("Functions_presentation/Taxonomy_RA_Mean.R") 
+source("Functions_presentation/color_palettes.R") 
+
+
+phyla_relative_abundance_mean_fungi <- plot_relative_abundance_with_means(
+  data_species = data_renormalized_fungi,
+  metadata = metadata_smokers_decontam_fungi,
+  level = "Phyla",
+  low_abundance_threshold = 10,  # <-- here!
+  colors_list = fungi_phyla_colors,
+  genus_colors = fungi_phyla_colors,
+  group_var = "treatment",
+  tag_label = "(C)"
+)
+
+
+
+# Genus plot with 10% threshold for grouping low abundance taxa
+
+
+species_relative_abundance_mean_fungi <- plot_relative_abundance_with_means(
+  data_species = data_renormalized_fungi,
+  metadata = metadata_smokers_decontam_fungi,
+  level = "Species",
+  low_abundance_threshold = 10,  # <-- here!
+  colors_list = fungi_species_colors,
+  genus_colors = fungi_species_colors, 
+  group_var = "treatment",
+  tag_label = "(D)"
+)
+
+
+
+# Table with the most abundant bacterial microbes in the dataset--------------------------
+
+phylum_abundance_data_fungi <- phyla_relative_abundance_mean_fungi$abundance_data
+species_abundance_data_fungi <- species_relative_abundance_mean_fungi$abundance_data
+
+# 3. Group and summarize: top N species per treatment
+top_n <- 3  # change to how many top species you want per group
+
+top_species_per_group_fungi <- species_abundance_data_fungi %>%
+  group_by(treatment, Species) %>%
+  summarise(mean_RA = mean(RA, na.rm = TRUE), .groups = "drop") %>%
+  group_by(treatment) %>%
+  slice_max(mean_RA, n = top_n, with_ties = FALSE) %>%
+  arrange(treatment, desc(mean_RA))
+
+#------------------------------------
+
+# 2. Aggregate to phylum level per sample
+library(dplyr)
+
+phylum_abundance_cleaned_fungi <- phylum_abundance_data_fungi %>%
+  select(-n, -label, -Color_Phyla, -Legend_Taxon) %>%
+  group_by(samples, treatment, Phyla) %>%
+  summarise(RA = round(sum(RA, na.rm = TRUE), 1), .groups = "drop")
+
+# 5. Get top phyla per treatment
+top_n <- 5
+top_phyla_per_group_fungi <- phylum_abundance_cleaned_fungi %>%
+  group_by(treatment, Phyla) %>%
+  summarise(mean_RA = mean(RA, na.rm = TRUE), .groups = "drop") %>%
+  group_by(treatment) %>%
+  slice_max(mean_RA, n = top_n, with_ties = FALSE) %>%
+  arrange(treatment, desc(mean_RA))
+
+```
+
+```{r Analysis_2 Taxonomy Plot}
+# Load the function from the external R file
+source("Functions_presentation/Taxonomy_relative_abundance_virus.R") 
+source("Functions_presentation/color_palettes.R") 
+source("Functions_presentation/Taxonomy_RA_Mean.R") 
+
+
+order_relative_abundance_mean_virus <- plot_relative_abundance_with_means(
+  data_species = data_renormalized_virus,
+  metadata = metadata_smokers_virus ,
+  level = "Order",
+  low_abundance_threshold = 15,  # <-- here!
+  colors_list = viral_order_colors,
+  genus_colors = viral_order_colors,
+  group_var = "treatment",
+  tag_label = "(E)"
+)
+
+
+
+#  Genus plot with 10% threshold for grouping low abundance taxa
+
+
+species_relative_abundance_mean_virus <- plot_relative_abundance_with_means(
+  data_species = data_renormalized_virus,
+  metadata = metadata_smokers_virus,
+  level = "Species",
+  low_abundance_threshold = 15,  # <-- here!
+  colors_list = viral_species_colors,
+  genus_colors = viral_species_colors, 
+  group_var = "treatment",
+  tag_label = "(F)"
+)
+
+
+
+# Table with the most abundant bacterial microbes in the dataset--------------------------
+
+order_abundance_data_virus <- order_relative_abundance_mean_virus$abundance_data
+species_abundance_data_virus <- species_relative_abundance_mean_virus$abundance_data
+
+# 3. Group and summarize: top N species per treatment
+top_n <- 5  # change to how many top species you want per group
+
+top_species_per_group_virus <- species_abundance_data_virus %>%
+  group_by(treatment, Species) %>%
+  summarise(mean_RA = mean(RA, na.rm = TRUE), .groups = "drop") %>%
+  group_by(treatment) %>%
+  slice_max(mean_RA, n = top_n, with_ties = FALSE) %>%
+  arrange(treatment, desc(mean_RA))
+
+#------------------------------------
+
+# 2. Aggregate to phylum level per sample
+library(dplyr)
+
+order_abundance_cleaned_virus <- order_abundance_data_virus %>%
+  select(-n, -label, -Color_Order, -Legend_Taxon) %>%
+  group_by(samples, treatment, Order) %>%
+  summarise(RA = round(sum(RA, na.rm = TRUE), 1), .groups = "drop")
+
+# 5. Get top phyla per treatment
+top_n <- 5
+top_order_per_group_virus <- order_abundance_cleaned_virus %>%
+  group_by(treatment, Order) %>%
+  summarise(mean_RA = mean(RA, na.rm = TRUE), .groups = "drop") %>%
+  group_by(treatment) %>%
+  slice_max(mean_RA, n = top_n, with_ties = FALSE) %>%
+  arrange(treatment, desc(mean_RA))
+
+```
+
+## Alpha Diversity Analysis
+
+Alpha diversity metrics are calculated to assess within-sample microbial diversity across smoking status groups. Here, the Shannon diversity index is computed for each sample, and statistical tests are performed to compare diversity between smokers and non-smokers, with visualizations generated for interpretation of group differences.
+
+```{r Analysis_3 alpha diversity}
+
+source("Functions_presentation/alpha_diversity_stars_pvalue.R") 
+metrics <- c("diversity")  # can add "richness", "evenness", "simpson"
+
+##BACTERIA
+taxData_bacteria <- as.data.frame(data_renormalized_bacteria)
+taxData_bacteria <- `rownames<-`(taxData_bacteria[, -1], taxData_bacteria[, 1])
+
+for (m in metrics) {
+  cat("Bacteria - metric:", m, "\n")
+  
+  result_alpha_bacteria <- alpha_diversity_analysis(
+    species_df = taxData_bacteria,
+    metadata_df = metadata_smokers_decontam_bacteria,
+    metric = m,
+    group_var = "treatment",
+    group_levels = c("non-smoker", "smoker"),
+    color_values = c("indianred1", "thistle4"),
+    tag_label = "(A)", 
+    y_expand = 1.6
+  )
+  
+  print(result_alpha_bacteria$test)
+  print(result_alpha_bacteria$normality)
+}
+
+
+##FUNGI
+taxData_fungi <- as.data.frame(data_renormalized_fungi)
+taxData_fungi <- `rownames<-`(taxData_fungi[, -1], taxData_fungi[, 1])
+
+for (m in metrics) {
+  cat("Fungi - metric:", m, "\n")
+  
+  result_alpha_fungi <- alpha_diversity_analysis(
+    species_df = taxData_fungi,
+    metadata_df = metadata_smokers_decontam_fungi,
+    metric = m,
+    group_var = "treatment",
+    group_levels = c("non-smoker", "smoker"),
+    color_values = c("indianred1", "thistle4"),
+    tag_label = "(B)", 
+    y_expand = 1.6
+  )
+  
+  print(result_alpha_fungi$test)
+  print(result_alpha_fungi$normality)
+}
+
+
+##VIRUS
+taxData_virus <- as.data.frame(data_renormalized_virus)
+taxData_virus <- `rownames<-`(taxData_virus[, -1], taxData_virus[, 1])
+
+for (m in metrics) {
+  cat("Virus - metric:", m, "\n")
+  
+  result_alpha_virus <- alpha_diversity_analysis(
+    species_df = taxData_virus,
+    metadata_df = metadata_smokers_virus,
+    metric = m,
+    group_var = "treatment",
+    group_levels = c("non-smoker", "smoker"),
+    color_values = c("indianred1", "thistle4"),
+    tag_label = "(C)", 
+    y_expand = 1.6
+  )
+  
+  print(result_alpha_virus$test)
+  print(result_alpha_virus$normality)
+}
+
+```
+
+
+## Beta Diversity Analysis
+
+Beta diversity is assessed to evaluate differences in overall microbial community composition between smokers and non-smokers. Principal coordinates analysis (PCoA) is performed using Bray–Curtis dissimilarities, and PERMANOVA is applied to test for statistically significant group differences. Visualizations include sample ordination plots with group-specific ellipses for interpretation of clustering patterns.
+
+```{r Analysis_4 beta diversity}
+
+#Load
+source("Functions_presentation/beta_diversity_withpermanova.R") 
+
+methods <- c("PCoA")  # Can add "PCA", "NMDS", "CAP"
+custom_colors <- c("non-smoker" = "indianred1", "smoker" = "thistle4")
+
+##BACTERIA
+
+for (m in methods) {
+  cat("Bacteria - beta diversity with method:", m, "\n")
+  
+  result_beta_bacteria <- beta_diversity_analysis(
+    species_df = taxData_bacteria,
+    metadata_df = metadata_smokers_decontam_bacteria, 
+    method = m,
+    color_var = "treatment",
+    formula_vars = c("treatment"),
+    color_values = custom_colors,
+    ellipse = TRUE, 
+    fill_label = "Smoking behaviour", 
+    tag_label = "(D)"
+  )
+  
+}
+
+# Save outputs
+beta_plot_bacteria <- result_beta_bacteria$plot
+permanova_bacteria <- result_beta_bacteria$permanova
+distance_matrix_bacteria <- result_beta_bacteria$distance_matrix
+
+##FUNGI
+for (m in methods) {
+  cat("Fungi - beta diversity with method:", m, "\n")
+  
+  result_beta_fungi <- beta_diversity_analysis(
+    species_df = taxData_fungi,
+    metadata_df = metadata_smokers_decontam_fungi, 
+    method = m,
+    color_var = "treatment",
+    formula_vars = c("treatment"),
+    color_values = custom_colors,
+    ellipse = TRUE, 
+    fill_label = "Smoking behaviour", 
+    tag_label = "(E)"
+  )
+}
+
+beta_plot_fungi <- result_beta_fungi$plot
+permanova_fungi <- result_beta_fungi$permanova
+distance_matrix_fungi <- result_beta_fungi$distance_matrix
+
+
+##VIRUS
+for (m in methods) {
+  cat("Virus - beta diversity with method:", m, "\n")
+  
+  result_beta_virus <- beta_diversity_analysis(
+    species_df = taxData_virus,
+    metadata_df = metadata_smokers_virus, 
+    method = m,
+    color_var = "treatment",
+    formula_vars = c("treatment"),
+    color_values = custom_colors,
+    ellipse = TRUE, 
+    fill_label = "Smoking behaviour", 
+    tag_label = "(F)"
+  )
+}
+
+beta_plot_virus <- result_beta_virus$plot
+permanova_virus <- result_beta_virus$permanova
+distance_matrix_virus <- result_beta_virus$distance_matrix
+
+
+```
+
+
+## Differential Abundance Testing with MaAsLin2
+
+This step performs multivariable modeling to identify microbial taxa whose abundances are significantly associated with smoking status. Zero-inflated negative binomial models are applied to pseudo-count data, with fixed effects for treatment and random effects for batch, season, and sex. Multiple testing correction is applied to control false discovery, producing a list of taxa with significant associations for downstream interpretation.
+
+```{r Analysis_5 Differential abundance with stats, eval=FALSE, include=FALSE}
+
+# devtools::install_github("biobakery/maaslin2") # Install and load Maaslin2 if necessary
+absolute_counts_tp <- t(absolute_counts)
+
+rownames(metadata_smokers_decontam) <- metadata_smokers_decontam$sample_name
+library(Maaslin2)
+
+# Input: 
+# dataset: a table of relative abundances (samples as rows, taxa as columns)
+# metadata: metadata table with categorical or continuous variables of interest
+metadata_smokers$Season_sample <- factor(metadata_smokers$Season_sample)
+metadata_smokers$kit <- factor(metadata_smokers$kit)
+rownames(metadata_smokers) <- metadata_smokers[,2]
+# Running Maaslin2 with a fixed effect (e.g., "treatment") and random effect (e.g., "batch")
+fit_data <- Maaslin2(
+  input_data = absolute_counts_tp,          # Your relative abundance data
+  input_metadata = metadata_smokers_decontam, # Your metadata table
+  output = "../OUTPUT/Maaslin_output_pseudocounts_bacterial",            # Directory for output
+  normalization = "NONE",               # No normalization
+  transform = "NONE",                   # No transformation
+  min_abundance = 0.01,
+  min_prevalence = 0.35,
+  analysis_method = "ZINB",               # Linear model
+  max_significance = 0.05,              # Significance threshold
+  fixed_effects =c("treatment"),     # Your fixed effect(s)
+  random_effects = c("kit", "Season_sample", "sex"), # the difference you don't want to account for
+  correction = "BH",                    # Benjamini-Hochberg correction for p-values
+  standardize = FALSE,                  # No standardization
+  cores = 1                             # Number of cores to use
+)
+
+```
+
+## Comparative Analysis of Individual Species
+
+This section visualizes the relative abundance of specific microbial species (e.g., Staphylococcus aureus) across smoking status groups using MaAsLin2 results. The approach highlights taxa with differential abundance and provides intuitive plots for interpretation of group-specific patterns.
+
+```{r Comparative species analyisis}
+
+library(readr)
+# Load the function from the external R file
+source("Functions_presentation/Comparative_test_Maaslin.R") 
+
+result_A_bacteria <- plot_species_abundance(
+  species_name = "Staphylococcus_aureus", #Moraxella_osloensis , Cutibacterium_acnes, Staphylococcus_aureus
+  maaslin_result_file = "../OUTPUT/Maaslin_output_pseudocounts/all_results.tsv",
+  abundance_data = absolute_counts_bacteria,
+  metadata = metadata_smokers_decontam_bacteria, 
+  treatment_col = "treatment", 
+  custom_colors <- c("non-smoker" = "indianred1", "smoker" = "thistle4"),
+  tag_label = "(A)" 
+)
+
+result_B_fungi <- plot_species_abundance(
+  species_name = "Saccharomyces_cerevisiae", #Cryptococcus_neoformans , Saccharomyces_cerevisiae, Malassezia_globosa
+  maaslin_result_file = "../OUTPUT/Maaslin_output_pseudocounts_fungal/all_results.tsv",
+  abundance_data = absolute_counts_fungi,
+  metadata = metadata_smokers_decontam_fungi, 
+  treatment_col = "treatment", 
+  colors = c("non-smoker" = "indianred1", "smoker" = "thistle4"),
+  tag_label = "(B)" 
+)
+
+result_C_virus <- plot_species_abundance(
+  species_name = "Glypta_fumiferanae_ichnovirus", #Cyprinid_herpesvirus_1 , Glypta_fumiferanae_ichnovirus, Pandoravirus_salinus
+  maaslin_result_file = "../OUTPUT/Maaslin_output_pseudocounts_viral/all_results.tsv",
+  abundance_data = absolute_counts_virus,
+  metadata = metadata_smokers_virus, 
+  treatment_col = "treatment", 
+  colors = c("non-smoker" = "indianred1", "smoker" = "thistle4"),
+  tag_label = "(C)"
+)
+
+
+```
+
+```{r Composed_graphs_for_manuscript}
+
+
+##Figure 1. Relative abundance of OSM in bacterial, fungal and viral kingdoms
+library(ggplot2)
+library(patchwork)
+
+pA <- phyla_relative_abundance_mean_bacteria$plot
+pB <- species_relative_abundance_mean_bacteria$plot
+
+pC <- phyla_relative_abundance_mean_fungi$plot
+pD <- species_relative_abundance_mean_fungi$plot
+
+pE <- order_relative_abundance_mean_virus$plot
+pF <- species_relative_abundance_mean_virus$plot
+
+
+composed_figure <-(pA | pB) / (pC | pD) / (pE | pF)
+
+# side by side
+
+
+#ggsave("../OUTPUT/Figure_1.png",composed_figure, width = 32, height = 27, units = "in", dpi = 300)
+
+##Figure 2.- alpha and beta diversity of OSM in bacterial, fungal and viral kingdoms
+
+pdA <- result_alpha_bacteria$plot
+pdB <- result_alpha_fungi$plot
+pdC <- result_alpha_virus$plot
+
+pdD <- result_beta_bacteria$plot
+pdE <- result_beta_fungi$plot
+pdF <- result_beta_virus$plot
+
+
+composed_figure_2 <- (pdA | pdB | pdC) / (pdD | pdE | pdF)
+
+
+#ggsave("../OUTPUT/Figure_2.png",composed_figure_2, width = 40, height = 20, units = "in", dpi = 300)
+
+
+##Figure 3.- Differential expression analysis of bacterial, fungal and viral kingdoms
+
+DAa <- result_A_bacteria$plot
+DAb <- result_B_fungi$plot
+DAc <- result_C_virus$plot
+
+composed_figure_3 <- DAa | DAb | DAc
+
+
+#ggsave("../OUTPUT/Supl_Figure_1.png",composed_figure_3, width = 30, height = 9, units = "in", dpi = 300)
+
+```
+

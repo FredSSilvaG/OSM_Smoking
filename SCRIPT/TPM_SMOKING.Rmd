@@ -1,0 +1,326 @@
+---
+title: "Tear_Proteome_Analysis"
+output: pdf_document
+date: "2025-03-31"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+Tear Proteome Analysis — Seasonal Influence
+
+This R Markdown document is designed for the analysis of tear proteome data collected across different seasons. It integrates code, results, and documentation to provide a reproducible workflow for evaluating seasonal influences on protein expression.
+
+
+```{r Library}
+
+# Clean environment
+rm(list = ls())
+
+# Load required libraries
+library(readxl)     # Reading Excel files
+#install.packages("readxl")  # Install if not installed
+library(tidyverse)  # Data wrangling and visualization
+
+```
+
+## Data Loading & Preparation
+This section loads raw proteomic data, filters relevant datasets, and merges metadata to incorporate seasonal sampling information for downstream analysis.
+
+```{r Data_loading, echo=FALSE}
+
+# Check sheet names in the Excel file
+sheet_names <- excel_sheets("../INPUT/20230717_SM_DZ_Smokers_humandatabase.xlsx")
+
+# --- Load proteomic data ---
+
+# Filtered protein groups used in differential expression testing
+proteome_data_filt_hu <- read_excel(
+  "../INPUT/20230717_SM_DZ_Smokers_humandatabase.xlsx",
+  sheet = "proteinGroups DE test",
+  col_types = "text")
+
+# Experimental design for the samples
+Experimental_design_hu <- read_excel(
+  "../INPUT/20230717_SM_DZ_Smokers_humandatabase.xlsx",
+  sheet = "Experimental design")
+
+# Load metadata (includes seasonal information)
+metadata <- read.csv("../INPUT/OSM_metadata_smokers_contact_complete.csv", sep = ",", header = TRUE)
+
+```
+
+##Data Preparation: Filter Quantified Protein Columns
+This section selects columns corresponding to specific quantification methods and properly formatted sample identifiers from the filtered human proteomic dataset.
+
+```{r Data_preparation}
+
+# Copy filtered proteome data for transformation
+proteome_data_hu_filtered <- proteome_data_filt_hu
+
+# --- Define quantification methods of interest ---
+quant_methods <- c("Top3", "MaxLFQ", "FragI", "iTop3", "iMaxLFQ", "iFragI")
+
+# --- Create regex pattern to match quant method columns with valid sample IDs (e.g., 09_TPN) ---
+# Pattern explanation:
+#   - Any of the quant_methods
+#   - Followed by digits and a sample code (e.g., _TPN)
+quant_pattern <- paste0("(", paste(quant_methods, collapse = "|"), ").*\\d{2}_[A-Z]+(_[a-z])?")
+
+# --- Extract matching column names based on the pattern ---
+quant_cols <- grep(quant_pattern, names(proteome_data_hu_filtered), value = TRUE)
+
+# --- Subset the data to retain gene info and quantification columns only ---
+proteome_data_hu_filtered_trim <- proteome_data_hu_filtered %>%
+  dplyr::select(Gene, Description, all_of(quant_cols))
+
+```
+
+##Data Transformation: iMaxLFQ Log2 Normalization
+This section extracts the iMaxLFQ quantification data, performs a log₂ transformation, and removes any rows with missing values across samples.
+
+```{r Data_preparation}
+
+# --- Select columns corresponding to the "iMaxLFQ" quantification method ---
+imaxlfq_cols <- grep("iMaxLFQ", colnames(proteome_data_hu_filtered_trim), value = TRUE)
+
+# --- Subset the data to include only Gene and iMaxLFQ columns ---
+proteome_imaxlfq <- proteome_data_hu_filtered_trim %>%
+  dplyr::select(Gene, all_of(imaxlfq_cols))
+
+# --- Define a log2 transformation function (with pseudocount to avoid log(0)) ---
+log2_transform <- function(df, id_col = "Gene") {
+  # Convert numeric columns, excluding identifier
+  num_data <- df %>%
+    dplyr::select(-all_of(id_col)) %>%
+    mutate(across(everything(), as.numeric))
+  
+  # Apply log2 transformation with pseudocount
+  log_data <- log2(num_data + 1)
+  
+  # Combine transformed data back with identifier
+  bind_cols(df[[id_col]], log_data) %>%
+    setNames(c(id_col, colnames(log_data)))}
+
+# --- Apply transformation ---
+imaxlfq_log2 <- log2_transform(proteome_imaxlfq)
+
+# --- Remove rows with any NA values (complete cases only) ---
+imaxlfq_clean <- imaxlfq_log2 %>%
+  filter(if_all(-Gene, ~ !is.na(.)))
+
+# Preview transformed data
+head(imaxlfq_clean)
+
+```
+
+##Data Integration: Annotate iMaxLFQ Columns with Season Info
+This step renames the iMaxLFQ columns to include seasonal context, based on the experiment ID, improving clarity for seasonal comparisons.
+
+
+##Multivariate Analysis & Clustering: PCA, PERMANOVA, Heatmap
+This section performs exploratory analysis to assess the influence of seasonal sampling on tear proteome profiles.
+
+```{r Data_preparation}
+
+expr_matrix <- as.matrix(imaxlfq_clean[,-1])
+rownames(expr_matrix) <- imaxlfq_clean$Gene
+colnames(expr_matrix) <- gsub("^iMaxLFQ\\s+", "", colnames(expr_matrix))
+
+# Get unique sample names (columns)
+sample_ids <- colnames(expr_matrix)
+
+#Pad the numbers in the samplenames
+Experimental_design_hu <- Experimental_design_hu %>%
+  mutate(Sample.Name.Padded = str_replace(Sample.Name, "^([0-9])_", "0\\1_"))
+
+
+# Subset metadata with relevant columns and unique rows
+metadata <- Experimental_design_hu %>%
+  select(Sample.Name.Padded, Nb.of.samples, Patientnumber, LongGroupName, Contains, Sex, Age, BMI) %>%
+  distinct() %>%
+  filter(Sample.Name.Padded %in% sample_ids)
+
+#create a column treatment
+metadata <- metadata %>%
+  mutate(treatment = case_when(
+    LongGroupName == "Smoker (Raucher)" ~ "smoker",
+    LongGroupName == "Control (Normal)" ~ "non-smoker",
+    TRUE ~ NA_character_  # in case there are other values
+  ))
+
+
+```
+
+```{r PCA for general view}
+
+# Load the function
+source("Functions_presentation/beta_diversity_withpermanova.R") 
+
+# Define the beta diversity methods to iterate through
+methods <- c("PCA")
+
+# Define colors
+custom_colors <- c("non-smoker" = "indianred1", "smoker" = "thistle4")
+
+for (m in methods) {
+  cat("Processing beta diversity with method:", m, "\n")
+  
+  result_PCA <- beta_diversity_analysis(
+    species_df = expr_matrix,
+    metadata_df = metadata, 
+    method = m,
+    color_var = "treatment",
+    #shape_var = "kit",
+    formula_vars = c("treatment"),
+    color_values = custom_colors,
+    ellipse = T, 
+    tag_label = "(A)"
+  )
+  
+  # ⬇️ Save the PCA plot to a variable for later use
+  if (m == "PCA") {
+    pca_plot_object <- result_PCA$plot  # <-- This is your vector ggplot object
+  }
+}
+
+```
+
+
+##Diagnostic Plots: Expression Distribution & Sample Relationships
+Visualize the expression data distribution per sample and relationships among samples to spot potential outliers or batch effects.
+
+```{r continuation}
+
+# Extract season group labels from column names
+sample_names <- colnames(imaxlfq_clean)[-1]
+
+smoking_group <- sub(".*_(TPR|TPN).*", "\\1", sample_names)
+smoking_group <- factor(smoking_group)
+
+library(limma)
+
+# Boxplot: Expression values per sample (show distribution and variability)
+boxplot(expr_matrix, 
+        las = 2,                     # Rotate axis labels for readability
+        main = "Expression values per sample",
+        col = "lightblue")
+
+# Density plot: visualize overall expression distribution per sample
+plotDensities(expr_matrix, 
+              col = rainbow(ncol(expr_matrix)),
+              main = "Density Plot of Expression Values")
+
+# Multidimensional scaling (MDS) plot: visualize sample similarity in 2D space
+plotMDS(expr_matrix,
+        col = as.numeric(smoking_group),  # Color points by season group
+        pch = 16,                        # Solid circle points
+        cex = 1.5,                       # Increase point size
+        labels = NULL,                   # Hide sample labels for clarity
+        main = "MDS Plot of Samples")
+
+legend("topright", legend = levels(smoking_group), col = 1:length(levels(smoking_group)), pch = 16)
+
+```
+
+
+##Differential Expression Analysis & Venn Diagram Overlaps by Season
+
+```{r New Analysis}
+
+# Load necessary packages
+library(limma)
+library(VennDiagram)
+library(grid)
+
+# 1. Design matrix for season groups (no intercept)
+design <- model.matrix(~0 + smoking_group)
+colnames(design) <- levels(smoking_group)
+
+# 2. Define pairwise contrasts between seasons
+contrast_matrix <- makeContrasts(TPN - TPR, levels = design)  # Adjust if needed
+
+# 3. Fit linear model and apply contrasts
+fit <- lmFit(expr_matrix, design)
+fit2 <- contrasts.fit(fit, contrast_matrix)
+fit2 <- eBayes(fit2)
+
+# 4. Extract DE results for each pairwise contrast
+results_TPN_vs_TPR <- topTable(fit2, number = Inf, adjust = "fdr")
+
+# 5. Get significantly DE proteins (p-value < 0.05)
+sig_prots_smoking <- results_TPN_vs_TPR$ID[results_TPN_vs_TPR$adj.P.Val < 0.05]
+
+```
+
+##Visualization: Volcano Plot for Smokers and non-Smokers Differential Expression
+
+
+```{r Gene Visualization }
+
+# Load EnhancedVolcano package for easy volcano plot visualization
+library(EnhancedVolcano)
+
+# Generate Volcano Plot for TPN vs TPR contrast
+# Pick top 10 by p-value (or change to abs(logFC) if you prefer)
+top10 <- results_TPN_vs_TPR %>%
+  arrange(P.Value) %>%
+  slice(1:10) %>%
+  pull(ID)
+
+
+volanoplot <- EnhancedVolcano(
+  results_TPN_vs_TPR,
+  lab = rep("", nrow(results_TPN_vs_TPR)),
+  x = "logFC",
+  y = "adj.P.Val",
+  pCutoff = 0.05,
+  FCcutoff = 1,
+  col = c("grey", "gray60", "dodgerblue4", "firebrick1"),  # <-- custom colors
+  pointSize = 4,  # adjust circle size
+  labSize = 5,  # <-- increase/decrease this number to change label size
+  ylim = c(0, 0.3),
+  title = "Volcano Plot: smoker vs non-smoker",
+  subtitle = "No FDR-significant proteins",
+  caption = paste0("total = ", nrow(results_TPN_vs_TPR), " proteins")
+) +
+  labs(tag = "(B)") +   # ✅ panel label
+  theme(
+    axis.text.x = element_text(size = 22),
+    axis.text.y = element_text(size = 22),
+    axis.title.x = element_text(size = 22),
+    axis.title.y = element_text(size = 22),
+    legend.text = element_text(size = 35),
+    legend.title = element_text(size = 35),
+    legend.position = "bottom",
+    #plot.title = element_text(size = 25, face = "bold"),
+    plot.title = element_blank(),
+    #plot.subtitle = element_text(size = 18, , face = "bold"),
+    plot.subtitle = element_blank(),
+    plot.caption = element_blank(), 
+    plot.tag = element_text(face = "bold", size = 30),
+    plot.tag.position = c(0, 1.05)
+    )
+
+```
+
+```{r Figure_Composition }
+
+library(ggplot2)
+library(patchwork)
+
+pA <- result_PCA$plot
+pB <- volanoplot
+
+composed_figure <- pA | pB
+
+# side by side
+
+#ggsave("../OUTPUT/Figure_3.png",composed_figure, width = 30, height = 9, units = "in", dpi = 300)
+
+
+```
+
+
